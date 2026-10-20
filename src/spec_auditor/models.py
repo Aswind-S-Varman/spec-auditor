@@ -79,4 +79,8 @@ class AuditReport(BaseModel):
     def total(self) -> int:
         return len(self.findings)
 
+class AuditResponse(BaseModel):
+    """Exactly what the model is asked to return."""
+
+    findings: list[Finding] = Field(default_factory=list)
 
