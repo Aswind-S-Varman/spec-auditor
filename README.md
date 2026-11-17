@@ -1,241 +1,289 @@
-import streamlit as st
+# spec-auditor
+
+
+LLM-based quality auditor for requirement specifications, with verifiable findings.
+
+
+Spec Auditor sends a set of Markdown specifications to Google Gemini and asks for
+defects such as contradictions, ambiguities, broken references and gaps. Every
+finding must quote its evidence verbatim. Before anything is reported, each quote
+is checked against the source file it cites. Findings whose quotes can't be found
+are discarded and counted, not shown.
+
+
+> **Data notice:** auditing sends document text to Google Gemini. Use fictional or
+> non-sensitive documents only. Findings require human review.
+
+
+## Features
+
+
+- Audits several files together, including contradictions between files.
+- Evidence grounding: findings with unverifiable quotes are rejected.
+- Structured output validated with Pydantic, with one automatic retry that tells
+  the model why its previous response was rejected.
+- Markdown and Word (`.docx`) reports with breakdowns by file and type, detailed
+  findings, a summary and a coverage ledger.
+- Command-line tool and Streamlit web app.
+- A fixed, human-reviewed example report that runs without an API key.
+
+
+## Requirements
+
+
+- Python 3.10+
+- A Gemini API key (not needed to view the example report)
+
+
+## Installation
+
+
+```powershell
+pip install -e ".[app,gemini,dev]"
+```
+
+
+| Extra | Installs | Needed for |
+|---|---|---|
+| `gemini` | `google-genai` | Live audits |
+| `app` | `streamlit` | Web app |
+| `dev` | `pytest` | Tests |
+
+
+`requirements.txt` installs the `app` and `gemini` extras.
+
+
+## Configuration
+
+
+Settings come from environment variables or a `.env` file in the working directory:
+
+
+| Variable | Default | Description |
+|---|---|---|
+| `GEMINI_API_KEY` | _(empty)_ | Gemini API key. The CLI's `--api-key` overrides it. |
+| `MODEL_NAME` | `gemini-2.0-flash` | Gemini model used for audits. |
+
+
+Never commit `.env` files or API keys.
+
+
+## Usage
+
+
+### Command line
+
+
+```powershell
+spec-auditor samples/specs
+spec-auditor samples/specs -o reports --model gemini-2.0-flash
+```
+
+
+| Argument | Description |
+|---|---|
+| `folder` | Folder containing the `.md` specifications. Files starting with `audit-report` are skipped. |
+| `-o`, `--output` | Output folder (default: the input folder). |
+| `--model` | Model name (default: `MODEL_NAME`). |
+| `--api-key` | API key (default: `GEMINI_API_KEY`). |
+
+
+The CLI writes `audit-report.md` and `audit-report.docx`. Existing reports are never
+overwritten: later runs write `audit-report.v1.md`, `audit-report.v2.md`, and so on.
+Rejected findings are printed with the reason they were discarded.
+
+
+### Web app
+
+
+```powershell
+streamlit run src/spec_auditor/app.py
+```
+
+
+Enter an API key and model, upload up to 5 Markdown files (100 KB each, unique
+names), then select **Run audit**. Or select **Load reviewed example** to see a
+report without calling the API. Results show summary metrics, a findings table,
+per-file coverage, the full Markdown report and download buttons.
+
+
+The theme lives in `.streamlit/config.toml`. Light and dark palettes are defined, and
+users can switch between them from the app's main menu.
+
+
+## Python API
+
+
+The package can be used as a library. The pipeline has four steps:
+
+
+```python
+from pathlib import Path
 
 
 from spec_auditor.client import GeminiClient, audit_documents
-from spec_auditor.config import settings
 from spec_auditor.docx_export import build_docx
+from spec_auditor.loader import read_specs
 from spec_auditor.report import render_markdown
 from spec_auditor.validate import verify
-from spec_auditor.examples import build_example_report
 
 
-st.set_page_config(
-    page_title="Spec Auditor", page_icon=":material/fact_check:", layout="wide"
-)
+documents = read_specs(Path("samples/specs"))            # {filename: text}
+client = GeminiClient(api_key="...", model="gemini-2.0-flash")
 
 
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+response = audit_documents(documents, client)            # 1. ask the model
+report, rejected = verify(response, documents)           # 2. check the evidence
+markdown = render_markdown(report, rejected)             # 3. Markdown report
+word_bytes = build_docx(report)                          # 4. Word report
+```
 
 
+### Functions
 
 
-@st.cache_data
-def load_example():
-    example = build_example_report()
-    return example, render_markdown(example), build_docx(example)
+| Function | Module | Description |
+|---|---|---|
+| `read_specs(folder) -> dict[str, str]` | `loader` | Reads every `*.md` file in a folder, skipping `audit-report*` files. Exits if the folder is missing or contains no specifications. |
+| `next_available(path) -> Path` | `loader` | Returns `path`, or the first unused `name.vN.ext` if it already exists. |
+| `build_user_prompt(documents) -> str` | `prompt` | Builds the prompt with `--- FILE: name ---` boundaries, in sorted filename order. Raises `DocumentTooLargeError` over the size limits. |
+| `audit_documents(documents, client) -> AuditResponse` | `client` | Calls the model and parses the JSON. Retries once with the validation error, then raises `InvalidModelOutput`. |
+| `parse_response(raw) -> AuditResponse` | `client` | Strips code fences and validates the model's JSON against the schema. |
+| `verify(response, documents) -> (AuditReport, list[Rejection])` | `validate` | Keeps only findings whose every quote appears verbatim in the cited file, after normalising whitespace and typographic punctuation. |
+| `render_markdown(report, rejected=()) -> str` | `report` | Renders the Markdown report (sections A–E). |
+| `build_docx(report) -> bytes` | `docx_export` | Builds the Word report directly from the report object. |
+| `build_example_report() -> AuditReport` | `examples` | Returns the fixed, human-reviewed example report. |
 
 
+### Using another model provider
 
 
-def run_audit(api_key: str, model: str, uploads) -> None:
-    st.session_state.pop("audit", None)
-    if not uploads or not api_key.strip() or not model.strip():
-        st.error("Choose files and enter an API key and model.")
-        return
-    if len(uploads) > 5 or any(file.size > 100_000 for file in uploads):
-        st.error("Upload at most 5 files, each no larger than 100 KB.")
-        return
-    if len({file.name for file in uploads}) != len(uploads):
-        st.error("Each file must have a different name.")
-        return
-    try:
-        documents = {
-            file.name: file.getvalue().decode("utf-8-sig") for file in uploads
-        }
-        with st.spinner("Auditing specifications..."):
-            client = GeminiClient(api_key.strip(), model.strip())
-            response = audit_documents(documents, client)
-            report, rejected = verify(response, documents)
-            markdown = render_markdown(report, rejected)
-            word = build_docx(report)
-        st.session_state["audit"] = (
-            report,
-            markdown,
-            word,
-            len(rejected),
-            "Live audit: generated by the model; findings require human review.",
-        )
-    except Exception:
-        st.error(
-            "Audit failed. Check file encoding, input limits, model access, "
-            "API key, and quota. No report was produced."
-        )
+`audit_documents` accepts any object that matches the `ModelClient` protocol:
 
 
+```python
+class ModelClient(Protocol):
+    def complete(self, system: str, user: str) -> str: ...
+```
 
 
-def render_results(report, markdown, word, rejected, result_note) -> None:
-    severities = report.counts_by_severity()
+`complete` receives the system prompt and user prompt and must return the raw
+response text. `GeminiClient` calls `generate_content` with
+`response_mime_type="application/json"` and `temperature=0`. A stub client that
+returns canned JSON is enough for tests.
 
 
-    st.info(result_note, icon=":material/info:")
-    if rejected:
-        st.warning(
-            f"{rejected} findings rejected by evidence checks.",
-            icon=":material/report:",
-        )
+### Data model
 
 
-    top = st.columns(3)
-    top[0].metric("Findings", report.total, border=True)
-    top[1].metric("Files reviewed", len(report.reviewed_files), border=True)
-    top[2].metric("Rejected", rejected, border=True)
-    bottom = st.columns(3)
-    for column, severity in zip(bottom, severities):
-        column.metric(severity, severities[severity], border=True)
+Defined in `spec_auditor.models` (Pydantic v2):
 
 
-    findings_tab, coverage_tab, report_tab = st.tabs(
-        ["Findings", "Coverage", "Full report"]
-    )
+- **`Evidence`**: `file`, `quote`. Quotes must be at least 4 words long.
+- **`Finding`**: `evidence` (one or more), `section`, `issue`, `defect_type`,
+  `severity`, `suggested_fix`. Also has the properties `files` and `is_cross_file`.
+- **`AuditResponse`**: `findings`. This is exactly what the model must return.
+- **`AuditReport`**: `findings`, `reviewed_files`, plus `total`,
+  `counts_by_severity()`, `counts_by_type()` and `coverage_ledger()`.
+- **`Rejection`** (`validate`): the discarded `finding` and the `reason`.
 
 
-    with findings_tab:
-        if report.findings:
-            st.dataframe(
-                [
-                    {
-                        "#": number,
-                        "Severity": finding.severity.value,
-                        "Type": finding.defect_type.value,
-                        "Files": ", ".join(finding.files),
-                        "Section": finding.section,
-                        "Issue": finding.issue,
-                        "Evidence": " · ".join(
-                            f'{item.file}: "{item.quote}"' for item in finding.evidence
-                        ),
-                        "Suggested fix": finding.suggested_fix,
-                    }
-                    for number, finding in enumerate(report.findings, start=1)
-                ],
-                hide_index=True,
-                column_config={
-                    "#": st.column_config.NumberColumn(width="small"),
-                    "Severity": st.column_config.TextColumn(width="small"),
-                    "Issue": st.column_config.TextColumn(width="large"),
-                    "Evidence": st.column_config.TextColumn(width="large"),
-                    "Suggested fix": st.column_config.TextColumn(width="large"),
-                },
-            )
-        else:
-            st.success("No findings.", icon=":material/check_circle:")
+`DefectType`: Inconsistency, Logical error, Ambiguity, Incompleteness, Terminology,
+Broken reference, Domain error.
+`Severity`: High, Medium, Low.
 
 
-    with coverage_tab:
-        by_file, by_type = st.columns(2, gap="large")
-        with by_file:
-            st.subheader("By file")
-            for file, count in report.coverage_ledger().items():
-                with st.container(horizontal=True, vertical_alignment="center"):
-                    st.markdown(f":material/description: {file}")
-                    if count:
-                        st.badge(
-                            f"{count} finding(s)", icon=":material/error:", color="red"
-                        )
-                    else:
-                        st.badge(
-                            "No findings", icon=":material/check_circle:", color="green"
-                        )
-        with by_type:
-            st.subheader("By type")
-            counts = report.counts_by_type()
-            if counts:
-                st.dataframe(
-                    [{"Type": name, "Findings": count} for name, count in counts.items()],
-                    hide_index=True,
-                    column_config={"Findings": st.column_config.NumberColumn()},
-                )
-            else:
-                st.caption("No findings.")
+Example model response:
 
 
-    with report_tab:
-        st.markdown(markdown)
+```json
+{
+  "findings": [
+    {
+      "evidence": [
+        {"file": "pricing.md", "quote": "Promotional discounts stack with tier discounts."},
+        {"file": "pricing.md", "quote": "Promotional discounts do not stack with tier discounts."}
+      ],
+      "section": "3. Promotional Codes",
+      "issue": "The same section both permits and prohibits discount stacking.",
+      "defect_type": "Inconsistency",
+      "severity": "High",
+      "suggested_fix": "Confirm the intended policy and remove the conflicting statement."
+    }
+  ]
+}
+```
 
 
-    with st.container(border=True):
-        st.markdown("**Export**")
-        with st.container(horizontal=True):
-            st.download_button(
-                "Download Markdown",
-                markdown,
-                "audit-report.md",
-                mime="text/markdown",
-                icon=":material/download:",
-            )
-            st.download_button(
-                "Download Word",
-                word,
-                "audit-report.docx",
-                mime=DOCX_MIME,
-                icon=":material/download:",
-            )
+### Limits and errors
 
 
+| Limit | Value | Where enforced |
+|---|---|---|
+| Characters per file | 20,000 | `prompt.MAX_CHARS_PER_FILE` |
+| Combined characters | 60,000 | `prompt.MAX_TOTAL_CHARS` |
+| Model attempts | 2 | `client.MAX_ATTEMPTS` |
+| Minimum quote length | 4 words | `models.MIN_QUOTE_WORDS` |
+| Web uploads | 5 files, 100 KB each | `app.py` |
 
 
-st.title(":material/fact_check: Spec Auditor")
-st.caption("Audit requirement specifications for defects, grounded in quoted evidence.")
-st.warning(
-    "Auditing sends document text to Google Gemini. Use fictional or "
-    "non-sensitive documents only. Findings require human review.",
-    icon=":material/shield:",
-)
+| Exception | Raised when |
+|---|---|
+| `DocumentTooLargeError` | Input exceeds the character limits. |
+| `InvalidModelOutput` | The model's response isn't valid JSON or doesn't match the schema after all attempts. |
 
 
-inputs_column, results_column = st.columns([1, 2], gap="large")
+The system prompt tells the model to treat document contents as untrusted data
+and to ignore any instructions inside them.
 
 
-with inputs_column:
-    with st.container(border=True):
-        st.subheader("New audit")
-        with st.form("audit_form", border=False):
-            api_key = st.text_input("Gemini API key", type="password")
-            model = st.text_input("Model", value=settings.model_name)
-            uploads = st.file_uploader(
-                "Specification files", type=["md"], accept_multiple_files=True
-            )
-            submitted = st.form_submit_button(
-                "Run audit",
-                type="primary",
-                icon=":material/play_arrow:",
-                width="stretch",
-            )
-        if submitted:
-            run_audit(api_key, model, uploads)
+## Sample specifications
 
 
-        with st.container(horizontal=True):
-            if st.button("Load reviewed example", icon=":material/menu_book:"):
-                example, example_markdown, example_word = load_example()
-                st.session_state["audit"] = (
-                    example,
-                    example_markdown,
-                    example_word,
-                    0,
-                    "Example report: fixed and human-reviewed; no API call was made.",
-                )
-            if "audit" in st.session_state and st.button(
-                "Clear results", type="tertiary", icon=":material/close:"
-            ):
-                st.session_state.pop("audit", None)
-                st.rerun()
+`samples/specs/` contains three fictional specifications (`accounts.md`,
+`checkout.md`, `pricing.md`) with deliberately planted defects.
+`samples/PLANTED_DEFLECTS.md` is the answer key for checking audit runs. It is
+never sent to the model.
 
 
-with results_column:
-    if "audit" in st.session_state:
-        render_results(*st.session_state["audit"])
-    else:
-        with st.container(border=True):
-            st.subheader(":material/analytics: No report yet")
-            st.caption(
-                "Upload Markdown specifications and run an audit, "
-                "or load the reviewed example to see a report."
-            )
+## Project structure
 
 
+```
+src/spec_auditor/
+  app.py          Streamlit web app
+  cli.py          Command-line entry point (spec-auditor)
+  client.py       Model client protocol, Gemini client, retry loop
+  config.py       Settings from environment / .env
+  docx_export.py  Word report
+  examples.py     Fixed, human-reviewed example report
+  loader.py       Reads specifications, picks non-clashing output names
+  models.py       Pydantic data model
+  prompt.py       System prompt, user prompt, size limits
+  report.py       Markdown report
+  validate.py     Evidence verification
+tests/            pytest suite
+samples/          Sample specifications and answer key
+```
 
 
+## Testing
+
+
+```powershell
+pip install -e ".[dev]"
+pytest
+```
+
+
+The tests don't call the Gemini API. If you haven't installed the package, run them
+with `PYTHONPATH=src` (PowerShell: `$env:PYTHONPATH="src"; pytest`).
+
+
+## License
+
+
+MIT. See [LICENSE](LICENSE).
 
 
 
