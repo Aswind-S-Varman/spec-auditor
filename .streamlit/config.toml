@@ -1,2 +1,29 @@
 [server]
 maxUploadSize = 1
+
+[theme]
+base = "dark"
+font = "sans-serif"
+headingFont = "sans-serif"
+baseRadius = "medium"
+showWidgetBorder = true
+
+# Defining both variants enables the System/Light/Dark switcher in the main menu.
+[theme.dark]
+primaryColor = "#6366F1"
+backgroundColor = "#0F1117"
+secondaryBackgroundColor = "#1A1D27"
+textColor = "#E5E7EB"
+borderColor = "#2A2E3A"
+dataframeHeaderBackgroundColor = "#1A1D27"
+
+[theme.light]
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F5F7"
+textColor = "#111827"
+borderColor = "#E5E7EB"
+dataframeHeaderBackgroundColor = "#F4F5F7"
+
+
+
